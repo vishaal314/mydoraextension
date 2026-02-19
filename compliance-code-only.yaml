@@ -1,0 +1,960 @@
+# ============================================================
+# EU Compliance Scanner — Code Scan Only (No Slack)
+# Triggers: push, pull_request, manual (workflow_dispatch)
+# ============================================================
+# What this scans:
+#   - Your source code (.py .js .ts .go .java .rs .c .cpp etc.)
+#   - SBOM (software bill of materials)
+#   - NIS2 security checks
+#   - DORA compliance checks
+#   - GPU/AI code (.cu, PyTorch, TF, Jupyter notebooks)
+#
+# NO Slack. NO AWS. NO external services.
+# All results go to GitHub Actions Artifacts tab.
+# ============================================================
+
+name: EU Compliance — Code Scanner
+
+on:
+  # ── Automatic: runs on every push to these branches
+  push:
+    branches:
+      - main
+      - develop
+      - "release/**"
+
+  # ── Automatic: runs when a Pull Request is opened or updated
+  pull_request:
+    branches:
+      - main
+      - develop
+
+  # ── Manual: you can trigger this from the GitHub UI with options
+  workflow_dispatch:
+    inputs:
+      scan_target:
+        description: "What to scan"
+        required: true
+        default: "full"
+        type: choice
+        options:
+          - full              # everything
+          - code-only         # just language security (Python, JS, Go etc.)
+          - dora-only         # just DORA compliance checks
+          - nis2-only         # just NIS2 checks
+          - sbom-only         # just SBOM generation
+          - gpu-only          # just CUDA/PyTorch/AI checks
+      fail_on_severity:
+        description: "Fail the pipeline on this severity or higher"
+        required: true
+        default: "CRITICAL"
+        type: choice
+        options:
+          - CRITICAL          # only fail on critical (recommended)
+          - HIGH              # fail on high or critical
+          - MEDIUM            # fail on medium, high, or critical
+          - NONE              # never fail — report only
+
+env:
+  REPORT_DIR: compliance-reports
+  SBOM_DIR:   sbom-output
+  FINAL_DIR:  final-report
+
+# ============================================================
+# JOB 1 — SBOM Generation
+# ============================================================
+jobs:
+  sbom:
+    name: "SBOM — Software Bill of Materials"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.scan_target == 'full' ||
+      inputs.scan_target == 'sbom-only'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Syft
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          mkdir -p ${{ env.SBOM_DIR }} ${{ env.REPORT_DIR }}
+
+      - name: Generate SBOM (CycloneDX + SPDX)
+        run: |
+          syft . -o cyclonedx-json=${{ env.SBOM_DIR }}/sbom-cyclonedx.json
+          syft . -o spdx-json=${{ env.SBOM_DIR }}/sbom-spdx.json
+          syft . -o table=${{ env.SBOM_DIR }}/sbom-summary.txt
+          echo "Components found: $(python3 -c "import json; d=json.load(open('${{ env.SBOM_DIR }}/sbom-cyclonedx.json')); print(len(d.get('components',[])))")"
+
+      - name: Validate SBOM completeness
+        run: |
+          python3 << 'EOF'
+          import json, os
+          with open("${{ env.SBOM_DIR }}/sbom-cyclonedx.json") as f:
+              sbom = json.load(f)
+          violations = []
+          for c in sbom.get("components", []):
+              n = c.get("name","?")
+              v = c.get("version","")
+              if not c.get("licenses"):
+                  violations.append(f"MISSING_LICENSE: {n}@{v}")
+              if not v or v.lower() in ["latest","unknown",""]:
+                  violations.append(f"MISSING_VERSION: {n}")
+          os.makedirs("${{ env.REPORT_DIR }}", exist_ok=True)
+          with open("${{ env.REPORT_DIR }}/sbom-violations.json","w") as f:
+              json.dump({"violations": violations, "total": len(violations)}, f, indent=2)
+          print(f"[SBOM] {len(violations)} violations across {len(sbom.get('components',[]))} components")
+          EOF
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-output
+          path: |
+            ${{ env.SBOM_DIR }}/
+            ${{ env.REPORT_DIR }}/sbom-violations.json
+          retention-days: 90
+
+
+  # ============================================================
+  # JOB 2 — Multi-Language Code Security Scan
+  # ============================================================
+  code-scan:
+    name: "Code Security — Python / JS / TS / Go / Java / Rust / C / C++ / Ruby / PHP"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.scan_target == 'full' ||
+      inputs.scan_target == 'code-only'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install code scanning tools
+        run: |
+          pip install bandit semgrep --quiet
+          mkdir -p ${{ env.REPORT_DIR }}
+
+      - name: Trivy — CVE vulnerability scan
+        run: |
+          # Install Trivy
+          wget -qO- https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update -qq && sudo apt-get install -y trivy
+
+          # Scan for CVEs in all dependencies
+          trivy fs . \
+            --format json \
+            --output ${{ env.REPORT_DIR }}/cve-scan.json \
+            --severity CRITICAL,HIGH,MEDIUM \
+            --exit-code 0
+          echo "[Trivy] CVE scan complete"
+
+      - name: Trivy — Secret detection
+        run: |
+          trivy fs . \
+            --scanners secret \
+            --format json \
+            --output ${{ env.REPORT_DIR }}/secrets-scan.json \
+            --exit-code 0
+          echo "[Trivy] Secret scan complete"
+
+      - name: Bandit — Python security scan
+        run: |
+          if find . -name "*.py" \
+            -not -path "*/.venv/*" \
+            -not -path "*/node_modules/*" \
+            -not -path "*/dist/*" | head -1 | grep -q .; then
+            bandit -r . \
+              --exclude ./.venv,./node_modules,./dist,./build \
+              -f json \
+              -o ${{ env.REPORT_DIR }}/python-bandit.json \
+              --quiet || true
+            echo "[Bandit] Python scan complete"
+          else
+            echo '{"results":[],"errors":[]}' > ${{ env.REPORT_DIR }}/python-bandit.json
+            echo "[Bandit] No Python files found"
+          fi
+
+      - name: Semgrep — Multi-language SAST
+        run: |
+          semgrep \
+            --config=auto \
+            --json \
+            --output=${{ env.REPORT_DIR }}/semgrep-all.json \
+            --exclude=node_modules \
+            --exclude=.venv \
+            --exclude=vendor \
+            --exclude=dist \
+            . || true
+          echo "[Semgrep] SAST scan complete"
+
+      - name: Custom — Python compliance checks
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          violations = []
+          exclude = {".git","node_modules",".venv","dist","build","vendor"}
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in exclude]
+              for fname in files:
+                  if not fname.endswith(".py"):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  try:
+                      content = open(fpath, errors="ignore").read()
+                  except:
+                      continue
+
+                  checks = [
+                      (r"pickle\.loads?\s*\(",       "CRITICAL", "Unsafe pickle deserialization — RCE risk",     "Replace pickle with json.loads()"),
+                      (r"\beval\s*\(|\bexec\s*\(",   "HIGH",     "eval()/exec() — code injection risk",           "Remove eval/exec"),
+                      (r'execute\s*\(\s*["\'].*%s',  "HIGH",     "SQL injection via string formatting",           "Use parameterized queries"),
+                      (r"except\s*:\s*\n\s*pass",    "MEDIUM",   "Silent exception (except: pass) — hides errors","Add logging inside except block"),
+                      (r"DEBUG\s*=\s*True",           "HIGH",     "DEBUG=True hardcoded",                         "Use env var: os.environ.get('DEBUG','False')"),
+                      (r"verify\s*=\s*False",        "HIGH",     "SSL verification disabled (verify=False)",      "Remove verify=False or use proper cert bundle"),
+                  ]
+                  for pattern, severity, msg, fix in checks:
+                      if re.search(pattern, content):
+                          violations.append({
+                              "language":"Python", "severity":severity,
+                              "file":fpath, "violation":msg, "remediation":fix
+                          })
+          with open("${{ env.REPORT_DIR }}/python-custom.json","w") as f:
+              json.dump(violations, f, indent=2)
+          print(f"[Python] {len(violations)} custom violations")
+          EOF
+
+      - name: Custom — JavaScript / TypeScript checks
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          violations = []
+          exclude = {".git","node_modules","dist","build",".venv"}
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in exclude]
+              for fname in files:
+                  if not fname.endswith((".js",".ts",".jsx",".tsx",".mjs")):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  try:
+                      content = open(fpath, errors="ignore").read()
+                  except:
+                      continue
+
+                  checks = [
+                      (r"\beval\s*\(",                          "HIGH",   "eval() usage — code injection",       "Remove eval()"),
+                      (r"dangerouslySetInnerHTML",              "HIGH",   "dangerouslySetInnerHTML — XSS risk",  "Sanitize with DOMPurify"),
+                      (r"document\.write\s*\(",                 "MEDIUM", "document.write() — XSS risk",        "Use safe DOM methods"),
+                      (r"createHash\(['\"]md5['\"]|createHash\(['\"]sha1['\"]", "HIGH", "Weak hash MD5/SHA1", "Use SHA-256 or bcrypt"),
+                      (r"InsecureSkipVerify|rejectUnauthorized\s*:\s*false", "CRITICAL","TLS verification disabled","Remove InsecureSkipVerify"),
+                  ]
+                  for pattern, severity, msg, fix in checks:
+                      if re.search(pattern, content):
+                          violations.append({
+                              "language":"JavaScript/TypeScript","severity":severity,
+                              "file":fpath,"violation":msg,"remediation":fix
+                          })
+          with open("${{ env.REPORT_DIR }}/js-custom.json","w") as f:
+              json.dump(violations, f, indent=2)
+          print(f"[JS/TS] {len(violations)} violations")
+          EOF
+
+      - name: Custom — Go / Java / Rust / C / C++ / Ruby / PHP checks
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          violations = []
+          exclude = {".git","node_modules",".venv","vendor","dist"}
+
+          lang_rules = {
+              ".go":   [
+                  (r"InsecureSkipVerify\s*:\s*true",           "CRITICAL","TLS verification disabled in Go",    "Remove InsecureSkipVerify"),
+                  (r'"math/rand"',                             "HIGH",   "math/rand used — not cryptographically secure","Use crypto/rand"),
+                  (r'fmt\.Sprintf\(".*SELECT|fmt\.Sprintf\(".*INSERT',"HIGH","SQL injection via fmt.Sprintf","Use db.Query with ? placeholders"),
+              ],
+              ".java": [
+                  (r"ObjectInputStream|readObject\s*\(",        "HIGH",   "Java deserialization — RCE risk",     "Avoid ObjectInputStream on untrusted data"),
+                  (r'Statement\s+\w+\s*=.*createStatement|executeQuery\s*\(\s*".*\+',"HIGH","SQL injection","Use PreparedStatement"),
+                  (r'MessageDigest\.getInstance\("MD5"\)|MessageDigest\.getInstance\("SHA-1"\)',"HIGH","Weak hash MD5/SHA-1","Use SHA-256"),
+              ],
+              ".rs":   [
+                  (r"\bunsafe\s*\{",                            "MEDIUM", "Rust unsafe block",                   "Document safety invariants; minimize unsafe usage"),
+              ],
+              ".c":    [
+                  (r"\bgets\s*\(",                              "CRITICAL","gets() — buffer overflow",           "Replace with fgets()"),
+                  (r"\bstrcpy\s*\(",                            "HIGH",   "strcpy() — buffer overflow risk",     "Replace with strncpy() or strlcpy()"),
+                  (r"\bsprintf\s*\(",                           "HIGH",   "sprintf() — format string risk",      "Replace with snprintf()"),
+              ],
+              ".cpp":  [
+                  (r"\bgets\s*\(",                              "CRITICAL","gets() — buffer overflow",           "Replace with fgets()"),
+                  (r"\bstrcpy\s*\(",                            "HIGH",   "strcpy() — buffer overflow",          "Replace with strncpy()"),
+              ],
+              ".rb":   [
+                  (r"\beval\s*\(",                              "HIGH",   "eval() in Ruby — code injection",     "Remove eval()"),
+                  (r'\.where\s*\(\s*".*#\{',                  "HIGH",   "SQL injection in ActiveRecord",       "Use .where('col = ?', value)"),
+              ],
+              ".php":  [
+                  (r"\beval\s*\(|\bexec\s*\(",                  "HIGH",   "eval()/exec() in PHP",               "Remove eval/exec"),
+                  (r"echo\s+\$_(GET|POST|REQUEST)",             "HIGH",   "XSS via direct echo of $_GET/$_POST","Sanitize with htmlspecialchars()"),
+                  (r"mysql_query\s*\(",                         "CRITICAL","Deprecated mysql_query() — SQL injection risk","Use PDO with prepared statements"),
+              ],
+          }
+
+          for ext, rules in lang_rules.items():
+              for root, dirs, files in os.walk("."):
+                  dirs[:] = [d for d in dirs if d not in exclude]
+                  for fname in files:
+                      if not fname.endswith(ext):
+                          continue
+                      fpath = os.path.join(root, fname)
+                      try:
+                          content = open(fpath, errors="ignore").read()
+                      except:
+                          continue
+                      for pattern, severity, msg, fix in rules:
+                          if re.search(pattern, content):
+                              violations.append({
+                                  "language": ext.lstrip(".").upper(),
+                                  "severity": severity,
+                                  "file": fpath,
+                                  "violation": msg,
+                                  "remediation": fix
+                              })
+
+          with open("${{ env.REPORT_DIR }}/multilang-custom.json","w") as f:
+              json.dump(violations, f, indent=2)
+          print(f"[MultiLang] {len(violations)} violations")
+          EOF
+
+      - name: Upload code scan reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-scan-reports
+          path: ${{ env.REPORT_DIR }}/
+          retention-days: 90
+
+
+  # ============================================================
+  # JOB 3 — DORA Checks
+  # ============================================================
+  dora-scan:
+    name: "DORA Compliance Checks (Art.5–44)"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.scan_target == 'full' ||
+      inputs.scan_target == 'dora-only'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run DORA checks
+        run: |
+          mkdir -p ${{ env.REPORT_DIR }}
+          python3 << 'EOF'
+          import os, json, glob
+
+          violations = []
+
+          def check_docs(article, doc_label, paths, severity="HIGH", requirement="", remediation=""):
+              found = any(
+                  os.path.exists(p) if "*" not in p else bool(glob.glob(p))
+                  for p in paths
+              )
+              if not found:
+                  violations.append({
+                      "article": article, "severity": severity,
+                      "violation": f"Missing: {doc_label}",
+                      "requirement": requirement,
+                      "remediation": remediation or f"Create one of: {', '.join(paths)}"
+                  })
+
+          # Chapter 2 — ICT Risk Management
+          check_docs("DORA-Art5",  "ICT Governance / Board Oversight doc",
+              ["docs/ict-governance.md","GOVERNANCE.md","docs/risk-governance.md"],
+              "HIGH","Art.5 requires board-level ICT risk oversight documentation")
+
+          check_docs("DORA-Art8",  "ICT Asset Register",
+              ["docs/asset-register.md","docs/ict-assets.md","docs/asset-inventory.md"],
+              "HIGH","Art.8 requires identification and classification of all ICT assets")
+
+          check_docs("DORA-Art9",  "Information Security Policy",
+              ["SECURITY.md",".github/SECURITY.md","docs/security-policy.md"],
+              "HIGH","Art.9 requires documented security policies")
+
+          check_docs("DORA-Art9",  "Access Control Policy",
+              ["docs/access-control.md","docs/iam-policy.md"],
+              "MEDIUM","Art.9 requires access control policy")
+
+          check_docs("DORA-Art11", "Backup & Recovery documentation",
+              ["docs/backup-recovery.md","docs/disaster-recovery.md","BCP.md"],
+              "HIGH","Art.11 requires documented backup and recovery procedures")
+
+          check_docs("DORA-Art11", "Business Continuity Plan (BCP)",
+              ["docs/bcp.md","docs/business-continuity.md"],
+              "HIGH","Art.11 requires a Business Continuity Plan")
+
+          # Check for RTO/RPO definitions
+          rto_found = False
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in [".git","node_modules"]]
+              for fname in files:
+                  if fname.endswith((".md",".yaml",".yml",".txt")):
+                      try:
+                          c = open(os.path.join(root,fname)).read().lower()
+                          if "rto" in c and "rpo" in c:
+                              rto_found = True
+                              break
+                      except: pass
+              if rto_found: break
+          if not rto_found:
+              violations.append({"article":"DORA-Art11","severity":"HIGH",
+                  "violation":"RTO and RPO not defined anywhere in documentation",
+                  "remediation":"Add RTO/RPO targets to docs/backup-recovery.md"})
+
+          # Chapter 3 — Incident Management
+          check_docs("DORA-Art17", "Incident Response Plan",
+              ["INCIDENT_RESPONSE.md","docs/incident-response.md"],
+              "CRITICAL","Art.17 requires documented incident management process")
+
+          # Check for regulatory reporting timeline (4h/72h/1-month rule)
+          reporting_found = False
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in [".git","node_modules"]]
+              for fname in files:
+                  if fname.endswith(".md"):
+                      try:
+                          c = open(os.path.join(root,fname)).read().lower()
+                          if ("72 hour" in c or "72h" in c) and ("4 hour" in c or "initial notification" in c):
+                              reporting_found = True
+                              break
+                      except: pass
+              if reporting_found: break
+          if not reporting_found:
+              violations.append({"article":"DORA-Art19","severity":"CRITICAL",
+                  "violation":"No 4h/72h/1-month regulatory reporting timeline documented",
+                  "remediation":"Add EBA/ESMA reporting timelines to INCIDENT_RESPONSE.md"})
+
+          # Chapter 4 — Resilience Testing
+          check_docs("DORA-Art25", "Penetration test records",
+              ["docs/pentest*.md","security/pentest*.md"],
+              "HIGH","Art.25 requires annual resilience testing documentation")
+
+          # Automated dependency updates
+          if not os.path.exists(".github/dependabot.yml") and not os.path.exists(".renovaterc.json") and not os.path.exists("renovate.json"):
+              violations.append({"article":"DORA-Art24","severity":"HIGH",
+                  "violation":"No automated dependency update tool configured (Dependabot/Renovate)",
+                  "remediation":"Create .github/dependabot.yml with weekly update schedule"})
+
+          # Chapter 5 — Third-Party Risk
+          check_docs("DORA-Art28", "Third-Party ICT Vendor Register (Register of Information)",
+              ["docs/third-party-register.md","docs/vendor-register.md","vendors.md"],
+              "CRITICAL","Art.28 requires Register of Information for all ICT third-party providers")
+
+          check_docs("DORA-Art30", "ICT Vendor Exit Strategy",
+              ["docs/exit-strategy.md","docs/vendor-exit-plan.md"],
+              "MEDIUM","Art.30 requires documented exit strategy for critical ICT providers")
+
+          os.makedirs("${{ env.REPORT_DIR }}", exist_ok=True)
+          with open("${{ env.REPORT_DIR }}/dora-all.json","w") as f:
+              json.dump(violations, f, indent=2)
+          print(f"[DORA] {len(violations)} violations found")
+          for v in violations:
+              print(f"  {v['severity']:8} [{v['article']}] {v['violation']}")
+          EOF
+
+      - name: Upload DORA reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: dora-reports
+          path: ${{ env.REPORT_DIR }}/dora-all.json
+          retention-days: 90
+
+
+  # ============================================================
+  # JOB 4 — NIS2 Checks
+  # ============================================================
+  nis2-scan:
+    name: "NIS2 Compliance Checks (Art.21 + Art.23)"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.scan_target == 'full' ||
+      inputs.scan_target == 'nis2-only'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run NIS2 checks
+        run: |
+          mkdir -p ${{ env.REPORT_DIR }}
+          python3 << 'EOF'
+          import os, json, re, glob
+
+          violations = []
+          exclude = {".git","node_modules",".venv","vendor","dist","build"}
+
+          # ── Secrets & weak crypto scan across ALL source files
+          secret_patterns = {
+              "hardcoded_password":  r'(?i)(password|passwd|pwd)\s*[=:]\s*["\'][^"\']{6,}["\']',
+              "hardcoded_api_key":   r'(?i)(api[_-]?key|apikey)\s*[=:]\s*["\'][^"\']{8,}["\']',
+              "hardcoded_token":     r'(?i)\btoken\s*[=:]\s*["\'][^"\']{8,}["\']',
+              "aws_access_key":      r'AKIA[0-9A-Z]{16}',
+              "private_key":         r'-----BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY-----',
+              "tls_disabled":        r'(?i)(tls|ssl)\s*:\s*(false|disabled)',
+              "insecure_http":       r'http://(?!localhost|127\.0\.0\.1|0\.0\.0\.0)',
+              "weak_hash_md5":       r'(?i)\bmd5\s*[\(=]|hashlib\.md5|MessageDigest\.getInstance\("MD5"\)',
+          }
+
+          code_exts = (".py",".js",".ts",".go",".java",".rs",".rb",".php",
+                       ".kt",".scala",".c",".cpp",".h",".cu",".cuh",
+                       ".yaml",".yml",".env",".conf",".toml")
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in exclude]
+              for fname in files:
+                  if not fname.endswith(code_exts):
+                      continue
+                  fpath = os.path.join(root, fname)
+                  try:
+                      content = open(fpath, errors="ignore").read()
+                  except:
+                      continue
+                  for pname, pattern in secret_patterns.items():
+                      if re.search(pattern, content):
+                          violations.append({
+                              "article":"NIS2-Art21","severity":"CRITICAL" if "password" in pname or "key" in pname or "private" in pname else "HIGH",
+                              "violation":f"{pname} detected in {fpath}",
+                              "remediation":"Remove hardcoded value — use environment variables or a secret manager"
+                          })
+
+          # ── Required documentation checks
+          required_docs = {
+              "NIS2-Art21(a) Security Policy":    ["SECURITY.md",".github/SECURITY.md","docs/security-policy.md"],
+              "NIS2-Art21(b) Incident Handling":  ["INCIDENT_RESPONSE.md","docs/incident-response.md"],
+              "NIS2-Art21(c) Business Continuity":["docs/bcp.md","docs/business-continuity.md"],
+              "NIS2-Art21(e) Patch Management":   [".github/dependabot.yml",".renovaterc.json","docs/patch-management.md"],
+          }
+          for req_name, paths in required_docs.items():
+              found = any(os.path.exists(p) if "*" not in p else bool(glob.glob(p)) for p in paths)
+              if not found:
+                  violations.append({
+                      "article":"NIS2-Art21","severity":"HIGH",
+                      "violation":f"Missing required document: {req_name}",
+                      "remediation":f"Create one of: {', '.join(paths)}"
+                  })
+
+          # ── NIS2 Art.23 — 72-hour incident reporting
+          reporting_found = False
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in [".git","node_modules"]]
+              for fname in files:
+                  if fname.endswith(".md"):
+                      try:
+                          c = open(os.path.join(root,fname)).read().lower()
+                          if ("72" in c) and ("ncsc" in c or "bsi" in c or "national authority" in c or "competent authority" in c):
+                              reporting_found = True
+                      except: pass
+          if not reporting_found:
+              violations.append({
+                  "article":"NIS2-Art23","severity":"CRITICAL",
+                  "violation":"No NIS2 72-hour incident reporting procedure to national authority (NCSC-NL/BSI)",
+                  "remediation":"Add NIS2 reporting timeline to INCIDENT_RESPONSE.md"
+              })
+
+          with open("${{ env.REPORT_DIR }}/nis2-all.json","w") as f:
+              json.dump(violations, f, indent=2)
+          print(f"[NIS2] {len(violations)} violations found")
+          for v in violations:
+              print(f"  {v['severity']:8} [{v['article']}] {v['violation']}")
+          EOF
+
+      - name: Upload NIS2 reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: nis2-reports
+          path: ${{ env.REPORT_DIR }}/nis2-all.json
+          retention-days: 90
+
+
+  # ============================================================
+  # JOB 5 — GPU / AI Code Scan
+  # ============================================================
+  gpu-ai-scan:
+    name: "GPU / AI Code — CUDA | PyTorch | TensorFlow | Notebooks"
+    runs-on: ubuntu-latest
+    if: >
+      github.event_name != 'workflow_dispatch' ||
+      inputs.scan_target == 'full' ||
+      inputs.scan_target == 'gpu-only'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install notebook scanner
+        run: |
+          pip install nbformat --quiet
+          mkdir -p ${{ env.REPORT_DIR }}
+
+      - name: Scan CUDA files (.cu / .cuh)
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          violations = []
+          cuda_files = [
+              os.path.join(root, f)
+              for root, dirs, files in os.walk(".")
+              for f in files if f.endswith((".cu",".cuh"))
+              if ".git" not in root
+          ]
+          print(f"[CUDA] Found {len(cuda_files)} CUDA files")
+
+          checks = [
+              (r'cudaMalloc',                          "HIGH",   "cudaMalloc without error check — silent GPU failures",          "Wrap with CUDA_CHECK() macro"),
+              (r'__shared__(?![\s\S]{0,200}__syncthreads)', "HIGH","__shared__ memory without __syncthreads() — race condition",  "Add __syncthreads() after shared memory writes"),
+              (r'cudaSetDevice\s*\(\s*\d+\s*\)',        "LOW",    "Hardcoded GPU device index",                                    "Use cudaGetDeviceCount() for dynamic selection"),
+              (r'privileged\s*:\s*true',                "CRITICAL","Privileged GPU container",                                    "Remove privileged:true — use nvidia device plugin"),
+          ]
+          for fpath in cuda_files:
+              content = open(fpath, errors="ignore").read()
+              for pattern, sev, msg, fix in checks:
+                  if re.search(pattern, content, re.DOTALL):
+                      violations.append({"language":"CUDA","severity":sev,"file":fpath,"violation":msg,"remediation":fix})
+
+          with open("${{ env.REPORT_DIR }}/gpu-cuda.json","w") as f:
+              json.dump({"files_scanned":len(cuda_files),"violations":violations}, f, indent=2)
+          print(f"[CUDA] {len(violations)} violations")
+          EOF
+
+      - name: Scan Python AI code (PyTorch / TF / JAX)
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          violations = []
+          ai_pattern = re.compile(r'import torch|import tensorflow|import jax|import keras|from torch|from tensorflow')
+          ai_files = []
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in {".git","node_modules",".venv","dist"}]
+              for fname in files:
+                  if fname.endswith(".py"):
+                      fpath = os.path.join(root, fname)
+                      try:
+                          c = open(fpath, errors="ignore").read()
+                          if ai_pattern.search(c):
+                              ai_files.append((fpath, c))
+                      except: pass
+
+          print(f"[AI-Python] Found {len(ai_files)} AI framework files")
+
+          model_card_exists = os.path.exists("MODEL_CARD.md") or os.path.exists("docs/model-card.md")
+
+          for fpath, content in ai_files:
+              # torch.load without weights_only=True — RCE risk
+              if re.search(r'torch\.load\s*\(', content) and "weights_only=True" not in content:
+                  violations.append({
+                      "language":"PyTorch","severity":"CRITICAL","file":fpath,
+                      "violation":"torch.load() without weights_only=True — arbitrary code execution risk (pickle RCE)",
+                      "remediation":"Change to: torch.load(path, weights_only=True)"
+                  })
+              # Missing model card
+              if not model_card_exists:
+                  violations.append({
+                      "language":"AI","severity":"HIGH","file":fpath,
+                      "violation":"No MODEL_CARD.md found for AI model (required by EU AI Act Art.13)",
+                      "remediation":"Create MODEL_CARD.md documenting model purpose, training data, limitations"
+                  })
+                  model_card_exists = True  # report once only
+              # No seed set — non-reproducible
+              if re.search(r'torch\.rand|np\.random|random\.', content) and not re.search(r'seed\s*\(|manual_seed\s*\(', content):
+                  violations.append({
+                      "language":"PyTorch/NumPy","severity":"MEDIUM","file":fpath,
+                      "violation":"Random calls without seed — non-reproducible results (EU AI Act Art.13)",
+                      "remediation":"Add: torch.manual_seed(42); np.random.seed(42)"
+                  })
+              # No logging on predictions
+              if re.search(r'model\s*\(|\.predict\s*\(|\.forward\s*\(', content) and not re.search(r'logging\.|logger\.', content):
+                  violations.append({
+                      "language":"AI","severity":"MEDIUM","file":fpath,
+                      "violation":"AI predictions without audit logging (DORA Art.10 / EU AI Act Art.13)",
+                      "remediation":"Add structured logging of model inputs/outputs for audit trail"
+                  })
+
+          with open("${{ env.REPORT_DIR }}/gpu-ai-python.json","w") as f:
+              json.dump({"ai_files_scanned":len(ai_files),"violations":violations}, f, indent=2)
+          print(f"[AI-Python] {len(violations)} violations")
+          EOF
+
+      - name: Scan Jupyter Notebooks (.ipynb)
+        run: |
+          python3 << 'EOF'
+          import os, json, re
+
+          try:
+              import nbformat
+          except ImportError:
+              print("[Notebooks] nbformat not available")
+              open("${{ env.REPORT_DIR }}/gpu-notebooks.json","w").write('{"violations":[]}')
+              exit(0)
+
+          violations = []
+          secret_re = re.compile(r'(?i)(api[_-]?key|password|token|secret)\s*=\s*["\'][^"\']{6,}["\']|AKIA[0-9A-Z]{16}')
+          nb_files = [
+              os.path.join(root, f)
+              for root, dirs, files in os.walk(".")
+              for f in files if f.endswith(".ipynb") and ".git" not in root
+          ]
+          print(f"[Notebooks] Found {len(nb_files)} notebooks")
+
+          for fpath in nb_files:
+              try:
+                  nb = nbformat.read(open(fpath), as_version=4)
+              except: continue
+              for i, cell in enumerate(nb.cells):
+                  if cell.cell_type != "code": continue
+                  if secret_re.search(cell.source):
+                      violations.append({"language":"Jupyter","severity":"CRITICAL","file":f"{fpath} cell {i+1}",
+                          "violation":"Hardcoded credential in notebook cell","remediation":"Use %env or dotenv — never commit secrets in notebooks"})
+                  for out in cell.get("outputs",[]):
+                      out_text = str(out.get("text","") or out.get("data",{}).get("text/plain",""))
+                      if secret_re.search(out_text):
+                          violations.append({"language":"Jupyter","severity":"CRITICAL","file":f"{fpath} cell {i+1} output",
+                              "violation":"Credential visible in notebook output","remediation":"Clear outputs: jupyter nbconvert --ClearOutputPreprocessor.enabled=True"})
+                  if "torch.load(" in cell.source and "weights_only=True" not in cell.source:
+                      violations.append({"language":"Jupyter/PyTorch","severity":"HIGH","file":f"{fpath} cell {i+1}",
+                          "violation":"torch.load() without weights_only=True in notebook","remediation":"Use torch.load(path, weights_only=True)"})
+
+          with open("${{ env.REPORT_DIR }}/gpu-notebooks.json","w") as f:
+              json.dump({"notebooks_scanned":len(nb_files),"violations":violations}, f, indent=2)
+          print(f"[Notebooks] {len(violations)} violations in {len(nb_files)} notebooks")
+          EOF
+
+      - name: Upload GPU/AI reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-ai-reports
+          path: ${{ env.REPORT_DIR }}/gpu-*.json
+          retention-days: 90
+
+
+  # ============================================================
+  # JOB 6 — Final Report
+  # ============================================================
+  report:
+    name: "Generate Final Violation Report"
+    runs-on: ubuntu-latest
+    needs: [sbom, code-scan, dora-scan, nis2-scan, gpu-ai-scan]
+    if: always()
+
+    steps:
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      - name: Build consolidated report
+        run: |
+          python3 << 'EOF'
+          import json, os, glob
+          from datetime import datetime
+
+          all_violations = []
+          by_category = {"sbom":[],"code":[],"dora":[],"nis2":[],"gpu_ai":[]}
+
+          cat_map = {
+              "sbom-violations":    "sbom",
+              "cve-scan":           "code",
+              "python-bandit":      "code",
+              "python-custom":      "code",
+              "js-custom":          "code",
+              "multilang-custom":   "code",
+              "semgrep-all":        "code",
+              "dora-all":           "dora",
+              "nis2-all":           "nis2",
+              "gpu-cuda":           "gpu_ai",
+              "gpu-ai-python":      "gpu_ai",
+              "gpu-notebooks":      "gpu_ai",
+          }
+
+          for fpath in glob.glob("all-reports/**/*.json", recursive=True):
+              stem = os.path.basename(fpath).replace(".json","")
+              cat = next((v for k,v in cat_map.items() if stem.startswith(k)), None)
+              if not cat:
+                  continue
+              try:
+                  data = json.load(open(fpath))
+                  items = data if isinstance(data,list) else data.get("violations",[])
+                  # Filter to only dict items with a violation field
+                  items = [i for i in items if isinstance(i,dict) and i.get("violation")]
+                  by_category[cat].extend(items)
+              except Exception as e:
+                  print(f"Warning: {fpath}: {e}")
+
+          all_violations = [v for cat in by_category.values() for v in cat]
+          sev_count = {"CRITICAL":0,"HIGH":0,"MEDIUM":0,"LOW":0,"INFO":0}
+          for v in all_violations:
+              s = v.get("severity","INFO").upper()
+              sev_count[s] = sev_count.get(s,0) + 1
+
+          report = {
+              "scan_date":  datetime.utcnow().isoformat()+"Z",
+              "repository": os.environ.get("GITHUB_REPOSITORY","unknown"),
+              "commit":     os.environ.get("GITHUB_SHA","unknown")[:8],
+              "trigger":    os.environ.get("GITHUB_EVENT_NAME","unknown"),
+              "branch":     os.environ.get("GITHUB_REF_NAME","unknown"),
+              "summary":    {**sev_count,"total":len(all_violations)},
+              "by_category": by_category,
+          }
+
+          os.makedirs("final-report", exist_ok=True)
+          with open("final-report/compliance-violations.json","w") as f:
+              json.dump(report, f, indent=2)
+
+          # Print summary
+          print("\n" + "="*55)
+          print("  EU COMPLIANCE SCANNER — RESULTS")
+          print("="*55)
+          print(f"  Repo   : {report['repository']} @ {report['commit']}")
+          print(f"  Branch : {report['branch']}")
+          print(f"  Trigger: {report['trigger']}")
+          print("="*55)
+          for cat, items in by_category.items():
+              print(f"  {cat.upper():12}: {len(items)} violations")
+          print("-"*55)
+          print(f"  TOTAL  : {len(all_violations)}")
+          print(f"  🔴 CRITICAL : {sev_count['CRITICAL']}")
+          print(f"  🟠 HIGH     : {sev_count['HIGH']}")
+          print(f"  🟡 MEDIUM   : {sev_count['MEDIUM']}")
+          print("="*55)
+          EOF
+
+      - name: Generate Markdown report
+        run: |
+          python3 << 'EOF'
+          import json
+
+          d = json.load(open("final-report/compliance-violations.json"))
+          s = d["summary"]
+          icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🔵","INFO":"⚪"}
+
+          md = f"""# 🇪🇺 EU Compliance Report
+
+**Repo:** `{d['repository']}` · **Branch:** `{d['branch']}` · **Commit:** `{d['commit']}` · **Date:** {d['scan_date']}
+
+## Summary
+
+| Category | Violations |
+|---|---|
+| SBOM | {len(d['by_category']['sbom'])} |
+| Code Security | {len(d['by_category']['code'])} |
+| DORA | {len(d['by_category']['dora'])} |
+| NIS2 | {len(d['by_category']['nis2'])} |
+| GPU / AI | {len(d['by_category']['gpu_ai'])} |
+| **TOTAL** | **{s['total']}** |
+
+| Severity | Count |
+|---|---|
+| 🔴 Critical | {s['CRITICAL']} |
+| 🟠 High | {s['HIGH']} |
+| 🟡 Medium | {s['MEDIUM']} |
+
+---
+"""
+          for cat_key, cat_label in [
+              ("sbom",   "SBOM"),
+              ("code",   "Code Security"),
+              ("dora",   "DORA Compliance"),
+              ("nis2",   "NIS2 Compliance"),
+              ("gpu_ai", "GPU / AI Code"),
+          ]:
+              items = d["by_category"][cat_key]
+              md += f"\n## {cat_label}\n\n"
+              if not items:
+                  md += "✅ No violations found.\n"
+                  continue
+              for v in items:
+                  sev = v.get("severity","INFO")
+                  art = v.get("article","")
+                  lang = v.get("language","")
+                  tag = f"`{art}`" if art else ""
+                  ltag = f" `[{lang}]`" if lang else ""
+                  md += f"### {icon.get(sev,'⚪')} {tag}{ltag} — {v.get('violation','')}\n"
+                  md += f"**Severity:** {sev}  \n"
+                  if v.get("remediation"):
+                      md += f"**Fix:** {v['remediation']}  \n"
+                  md += "\n"
+
+          open("final-report/compliance-report.md","w").write(md)
+          print("Markdown report generated ✓")
+          EOF
+
+      - name: Upload final report
+        uses: actions/upload-artifact@v4
+        with:
+          name: eu-compliance-report
+          path: final-report/
+          retention-days: 90
+
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('final-report/compliance-report.md','utf8');
+            const body = report.length > 4000
+              ? report.substring(0, 4000) + '\n\n_[Full report in Actions → Artifacts → eu-compliance-report]_'
+              : report;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `## 🇪🇺 EU Compliance Scanner\n\n${body}`
+            });
+
+      # ── Fail pipeline on violations above threshold ──────────
+      - name: Enforce compliance gate
+        run: |
+          python3 << 'EOF'
+          import json, os, sys
+
+          threshold = "${{ inputs.fail_on_severity || 'CRITICAL' }}"
+          d = json.load(open("final-report/compliance-violations.json"))
+          s = d["summary"]
+
+          levels = ["INFO","LOW","MEDIUM","HIGH","CRITICAL"]
+          threshold_idx = levels.index(threshold) if threshold in levels else 4
+
+          fail_count = sum(
+              s.get(sev, 0)
+              for sev in levels[threshold_idx:]
+          )
+
+          if fail_count > 0 and threshold != "NONE":
+              print(f"❌ PIPELINE FAILED: {fail_count} violations at {threshold} or above")
+              print(f"   Critical: {s['CRITICAL']}  High: {s['HIGH']}  Medium: {s['MEDIUM']}")
+              sys.exit(1)
+          else:
+              print(f"✅ Compliance gate passed (threshold: {threshold})")
+              print(f"   Total violations: {s['total']} (below threshold)")
+          EOF
